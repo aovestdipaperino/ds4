@@ -73436,6 +73436,111 @@ int ds4_session_set_directional_steering_ffn(ds4_session *s, float scale) {
     return 0;
 }
 
+/* Upload a host directions buffer into a GPU tensor slot, allocating it on
+ * `tier` when the session was created without a vector. */
+#ifndef DS4_NO_GPU
+static bool directional_steering_upload_tier(ds4_gpu_tensor **slot,
+                                             int tier,
+                                             const float *dirs,
+                                             uint64_t n) {
+    if (!*slot) *slot = ds4_gpu_tensor_alloc_ptr_on(tier, n * sizeof(dirs[0]));
+    return *slot != NULL &&
+           ds4_gpu_tensor_write(*slot, 0, dirs, n * sizeof(dirs[0])) != 0;
+}
+#endif
+
+int ds4_session_set_directional_steering_file(ds4_session *s, const char *path) {
+    if (!s || !s->engine || !path || !path[0]) return 1;
+    if (s->distributed || s->engine->tp.active) {
+        fprintf(stderr,
+                "ds4: live steering changes are not supported for distributed or network tensor-parallel sessions\n");
+        return 1;
+    }
+
+    const uint32_t n_layers = directional_steering_layer_count();
+    if (n_layers == 0) return 1;
+    const uint64_t n = (uint64_t)n_layers * DS4_N_EMBD;
+    float *dirs = xmalloc((size_t)n * sizeof(dirs[0]));
+    if (!read_f32_binary_file(path, dirs, n)) {
+        free(dirs);
+        return 1;
+    }
+
+    bool ok = true;
+#ifndef DS4_NO_GPU
+    if (!ds4_session_is_cpu(s)) {
+        /* Tensor writes are a memcpy into shared storage: drain every
+         * command buffer that may still read the old directions. */
+        ok = ds4_gpu_synchronize() != 0;
+#ifdef DS4_HAS_QWEN4_GPU
+        if (ok && s->qwen4_graph_ready) {
+            ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
+            if (!g->steer_dirs) g->steer_dirs = ds4_gpu_tensor_alloc(n * sizeof(dirs[0]));
+            ok = g->steer_dirs != NULL &&
+                 ds4_gpu_tensor_write(g->steer_dirs, 0, dirs, n * sizeof(dirs[0])) != 0;
+            s->glm_mtp_have = 0;
+        } else
+#endif
+        if (ok && ds4_session_is_glm(s)) {
+            ds4_glm_gpu_graph *g = &s->glm_graph;
+            if (!g->glm53 || n_layers != g->normal_layers) {
+                fprintf(stderr, "ds4: directional steering is supported only for GLM 5.3\n");
+                ok = false;
+            }
+            bool used_tier[DS4_MAX_GPUS] = {false};
+            for (uint32_t il = g->layer_start; ok && il <= g->layer_end; il++) {
+                const int tier = glm_graph_directional_steering_tier(g, il);
+                if (tier < 0) ok = false;
+                else used_tier[tier] = true;
+            }
+            for (int t = 0; ok && t < DS4_MAX_GPUS; t++) {
+                if (!used_tier[t]) continue;
+                ok = directional_steering_upload_tier(
+                        &g->directional_steering_dirs_by_tier[t], t, dirs, n);
+            }
+            s->glm_mtp_have = 0;
+            s->glm_mtp_rollback_valid = false;
+        } else if (ok) {
+            ds4_gpu_graph *g = &s->graph;
+            bool any = false;
+            for (int t = 0; ok && t < DS4_MAX_GPUS; t++) {
+                if (!g->cur_hc_by_tier[t]) continue;
+                ok = directional_steering_upload_tier(
+                        &g->directional_steering_dirs_by_tier[t], t, dirs, n);
+                any = any || ok;
+            }
+            ok = ok && any;
+            ds4_session_dspark_capture_invalidate(s);
+        }
+    } else
+#endif
+    {
+        /* The CPU path reads the engine's buffer, shared by every session. */
+        if (!s->engine->directional_steering_dirs) {
+            s->engine->directional_steering_dirs = dirs;
+            dirs = NULL;
+        } else {
+            memcpy(s->engine->directional_steering_dirs, dirs, (size_t)n * sizeof(dirs[0]));
+        }
+    }
+    free(dirs);
+
+    if (!ok) {
+        fprintf(stderr, "ds4: failed to load directional steering vectors from %s\n", path);
+        return 1;
+    }
+    /* Sessions created from now on load the new direction. */
+    char *copy = ds4_strdup(path);
+    free(s->engine->directional_steering_file);
+    s->engine->directional_steering_file = copy;
+
+    s->mtp_draft_valid = false;
+    s->greedy_splitkv_segment.len = 0;
+    s->greedy_splitkv_anchor_valid = false;
+    fprintf(stderr, "ds4: directional steering direction switched to %s\n", path);
+    return 0;
+}
+
 void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud) {
     if (!s) return;
     s->progress = fn;

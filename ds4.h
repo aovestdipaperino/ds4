@@ -411,6 +411,12 @@ float ds4_session_directional_steering_ffn(ds4_session *s);
 /* Change steering for future evaluation without rebuilding the existing KV
  * state. Live changes are currently limited to non-distributed sessions. */
 int ds4_session_set_directional_steering_ffn(ds4_session *s, float scale);
+/* Replace the steering direction (a raw little-endian f32 file of
+ * n_layers * n_embd values, as for --dir-steering-file) for future
+ * evaluation, keeping the current scales and the existing KV state. Sessions
+ * created afterwards load the new file. On the CPU backend the directions are
+ * shared by every session of the engine. Non-distributed sessions only. */
+int ds4_session_set_directional_steering_file(ds4_session *s, const char *path);
 bool ds4_session_is_distributed(ds4_session *s);
 void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud);
 /* UI-only progress. It may report fine-grained progress inside a prefill chunk;
