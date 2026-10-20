@@ -71,7 +71,8 @@ static int check_router(void) {
     ds4_gpu_tensor *tok = upload(tokens, sizeof(tokens));
     CHECK(x && p && ids && weights && tok);
     const unsigned counts[] = {1, 3, 17, ROWS};
-    for (unsigned n = 256; n <= MAX_EXPERTS; n += 128) {
+    for (unsigned n = 128; n <= MAX_EXPERTS; n += 128) {
+        const unsigned USED = n == 128 ? 3 : 6;
         for (unsigned mode = 0; mode < 3; mode++) {
             for (unsigned i = 0; i < ROWS * n; i++) logits[i] = mode == 1 ? 0 :
                 mode == 2 ? (i % 2 ? -80 : 40) : random_value() * 8;
@@ -590,7 +591,7 @@ static int check_attention_output(bool large) {
     CHECK(ds4_gpu_end_commands());
     CHECK(ds4_gpu_tensor_read(out, 0, reference, ob));
     CHECK(ds4_gpu_tensor_read(low, 0, reference_low, lb));
-    const uint32_t sizes[] = {31, 32, 63, 64, 65, 257, 512, 513, 8191, 8192};
+    const uint32_t sizes[] = {1, 2, 3, 5, 6, 8, 31, 32, 63, 64, 65, 257, 512, 513, 8191, 8192};
     for (unsigned n = 0; n < sizeof(sizes) / sizeof(*sizes); n++) {
         const uint32_t rows = sizes[n];
         if (rows > ROWS) break;
@@ -614,10 +615,11 @@ static int check_attention_output(bool large) {
         0, a_bytes, xt, ROWS));
     CHECK(!ds4_gpu_dsv41_attention_output_batch(out, low, model, a_bytes + b_bytes,
         0, a_bytes, xt, ROWS + 1));
+#ifndef DS4_ROCM_BUILD
     ds4_gpu_tensor *packed = upload(NULL, xb / 2);
     ds4_gpu_tensor *partial[2] = {upload(NULL, ob), upload(NULL, ob)};
     CHECK(packed && partial[0] && partial[1]);
-    const uint32_t tp_sizes[] = {1, 31, 32, 33, 63, 64, 65, 127, 128, 129, 257, 512, 513};
+    const uint32_t tp_sizes[] = {1, 2, 3, 5, 6, 8, 31, 32, 33, 63, 64, 65, 127, 128, 129, 257, 512, 513};
     const uint32_t q_half = GROUPS / 2 * GROUP, low_half = GROUPS / 2 * RANK;
     for (size_t n = 0; n < sizeof(tp_sizes) / sizeof(*tp_sizes); n++) {
         const uint32_t rows = tp_sizes[n];
@@ -696,6 +698,9 @@ static int check_attention_output(bool large) {
     CHECK(!ds4_gpu_dsv41_attention_output_tp_batch(out, low, model, a_bytes + b_bytes,
         0, a_bytes, packed, ROWS + 1, 0));
     ds4_gpu_tensor_free(partial[0]); ds4_gpu_tensor_free(partial[1]); ds4_gpu_tensor_free(packed);
+#else
+    fprintf(stderr, "V4.1 TP output projection: skipped (ROCm has no network TP)\n");
+#endif
     ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(low); ds4_gpu_tensor_free(out);
     ds4_gpu_cleanup();
     free(x); free(reference); free(reference_low); free(model);
@@ -1022,7 +1027,7 @@ static int check_general_topk(void) {
 }
 
 static int check_causal_topk(void) {
-    const uint32_t frontiers[] = {1024, 1025, 1535, 2047, 2048, 4095, 16383, 32767, 65535};
+    const uint32_t frontiers[] = {1024, 1025, 1535, 2047, 2048, 4095, 4096, 8191, 8192, 16383, 32767, 65535};
     const uint32_t counts[] = {1, 2, 31, 32, 33, 127, 128, 129};
     for (uint32_t ratio = 1; ratio <= 2; ratio++) {
     for (size_t fi = 0; fi < sizeof(frontiers) / sizeof(*frontiers); fi++) {
@@ -1061,6 +1066,7 @@ static int check_causal_topk(void) {
                 CHECK(ds4_gpu_synchronize());
                 CHECK(ids[rows * 512u] == 123456);
                 for (uint32_t t = 0; t < rows; t++) {
+                    CHECK(s[(size_t)t * width + width - 1u] == 12345.0f);
                     for (uint32_t k = 0; k < 512u; k++) {
                         if (ids[t * 512u + k] != ref[t * 512u + k]) {
                             fprintf(stderr, "top-k mismatch ratio=%u visible=%u rows=%u pattern=%u row=%u rank=%u: %d vs %d\n",
@@ -1134,14 +1140,18 @@ static int check_compact_carry(void) {
  * Selected rows are shuffled; include masked future rows at odd frontiers. */
 static int check_tp_attention(void) {
     enum { D = 512, H = 64, K = 512, C = 2048 };
-    const uint32_t sizes[] = {1, 31, 32, 33, 129, 257, 2048};
+    const struct { uint32_t rows, selected; } cases[] = {
+        {1, K}, {31, K}, {32, K}, {33, K}, {129, K}, {257, K}, {2048, K},
+        {1, 0}, {1, 1}, {2, K}, {6, K}, {8, K},
+        {2, 0}, {2, 1}, {6, 0}
+    };
     float *sinks = NULL;
     CHECK(posix_memalign((void **)&sinks, getpagesize(), getpagesize()) == 0);
     for (int h = 0; h < H; h++) sinks[h] = random_value();
     CHECK(ds4_gpu_set_model_map(sinks, getpagesize()));
     ds4_gpu_set_quality(false);
-    for (unsigned s = 0; s < sizeof(sizes) / sizeof(*sizes); s++) {
-        const uint32_t n = sizes[s], nr = n + 127, start = 3073;
+    for (unsigned s = 0; s < sizeof(cases) / sizeof(*cases); s++) {
+        const uint32_t n = cases[s].rows, nr = n + 127, start = 3073;
         const uint32_t ratio = 1u + s % 2u;
         const size_t nq = (size_t)n * H * D;
         float *q = malloc(nq * 4), *actual = malloc(nq * 4);
@@ -1154,7 +1164,9 @@ static int check_tp_attention(void) {
         for (uint32_t i = 0; i < C * D; i++) comp[i] = bf16(random_value() / 4);
         for (uint32_t t = 0; t < n; t++)
             for (uint32_t j = 0; j < K; j++)
-                ids[t * K + j] = j % 29 ? (int32_t)((j * 127u + t * 17u) % C) : -1;
+                ids[t * K + j] = j < cases[s].selected &&
+                    (cases[s].selected != K || j % 29)
+                    ? (int32_t)((j * 127u + t * 17u) % C) : -1;
         ds4_gpu_tensor *qt = upload(q, nq * 4), *rt = upload(raw, (size_t)nr * D * 4);
         ds4_gpu_tensor *ct = upload(comp, C * D * 4), *it = upload(ids, (size_t)n * K * 4);
         ds4_gpu_tensor *out = upload(NULL, nq * 4), *qp = upload(NULL, nq * 2);
@@ -1232,8 +1244,8 @@ static int check_tp_attention(void) {
                 }
             }
         }
-        fprintf(stderr, "V4.1 TP attention rows=%u ratio=%u max split=%g oracle=%g: PASS\n",
-            n, ratio, max_split, max_oracle);
+        fprintf(stderr, "V4.1 TP attention rows=%u selected=%u ratio=%u max split=%g oracle=%g: PASS\n",
+            n, cases[s].selected, ratio, max_split, max_oracle);
         ds4_gpu_tensor_free(qt); ds4_gpu_tensor_free(rt); ds4_gpu_tensor_free(ct);
         ds4_gpu_tensor_free(it); ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(qp);
         ds4_gpu_tensor_free(op);
