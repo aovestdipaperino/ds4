@@ -10192,21 +10192,40 @@ static agent_mcp_tool *agent_mcp_find_tool(agent_mcp_server *s, const char *name
     return NULL;
 }
 
-/* Convert DSML call arguments into a JSON-RPC "arguments" object.  Per the
+/* GLM tool calls mark every argument as a string.  Emit one verbatim when the
+ * tool's schema declares a non-string type and the text is a complete JSON
+ * value. */
+static bool agent_mcp_arg_is_json_literal(const agent_json *props, const agent_tool_arg *a) {
+    const char *type = agent_json_str(agent_json_get(props, a->name), "type", "string");
+    if (!strcmp(type, "string") || !a->value) return false;
+    const char *p = a->value;
+    agent_json *v = NULL;
+    bool ok = agent_json_parse_value(&p, &v);
+    agent_json_free(v);
+    if (ok) agent_json_skip_ws(&p);
+    return ok && !*p;
+}
+
+/* Convert tool call arguments into a JSON-RPC "arguments" object.  Per the
  * tools-prompt contract, string=true args are raw text needing JSON escaping
  * and string=false args are already-valid JSON literals (numbers, booleans,
  * objects, arrays) that can be emitted verbatim. */
-static char *agent_mcp_args_to_json(const agent_tool_call *call) {
+static char *agent_mcp_args_to_json(const agent_tool_call *call, const char *schema_json) {
+    agent_json *schema = schema_json ? agent_json_parse(schema_json) : NULL;
+    agent_json *props = agent_json_get(schema, "properties");
     agent_buf b = {0};
     agent_buf_append(&b, "{", 1);
     for (int i = 0; i < call->argc; i++) {
+        const agent_tool_arg *a = &call->args[i];
         if (i) agent_buf_append(&b, ",", 1);
-        agent_json_escape(&b, call->args[i].name);
+        agent_json_escape(&b, a->name);
         agent_buf_append(&b, ":", 1);
-        if (call->args[i].is_string) agent_json_escape(&b, call->args[i].value);
-        else agent_buf_puts(&b, call->args[i].value ? call->args[i].value : "null");
+        if (a->is_string && !agent_mcp_arg_is_json_literal(props, a))
+            agent_json_escape(&b, a->value);
+        else agent_buf_puts(&b, a->value ? a->value : "null");
     }
     agent_buf_append(&b, "}", 1);
+    agent_json_free(schema);
     return agent_buf_take(&b);
 }
 
@@ -10244,7 +10263,7 @@ static char *agent_tool_mcp_call(agent_worker *w, const agent_tool_call *call) {
     agent_buf_puts(&params, "{\"name\":");
     agent_json_escape(&params, tool_name);
     agent_buf_puts(&params, ",\"arguments\":");
-    char *args_json = agent_mcp_args_to_json(call);
+    char *args_json = agent_mcp_args_to_json(call, tool->schema_json);
     agent_buf_puts(&params, args_json);
     free(args_json);
     agent_buf_append(&params, "}", 1);
@@ -10372,7 +10391,7 @@ static void test_agent_mcp_args_to_json_mixes_string_and_raw(void) {
                             agent_dsml_param_close(AGENT_TOOL_SYNTAX_DSML));
     agent_tool_call_add_arg(&call, "limit", "5", strlen("5"), false,
                             agent_dsml_param_close(AGENT_TOOL_SYNTAX_DSML));
-    char *json = agent_mcp_args_to_json(&call);
+    char *json = agent_mcp_args_to_json(&call, NULL);
     agent_json *v = agent_json_parse(json);
     AGENT_TEST_ASSERT(v != NULL);
     AGENT_TEST_ASSERT(!strcmp(agent_json_str(v, "query", ""), "hello \"world\""));
@@ -10523,11 +10542,33 @@ static void test_agent_mcp_describe_returns_directory_tool_schema(void) {
     agent_mcp_servers_free(s);
 }
 
+static void test_agent_mcp_args_to_json_follows_schema_for_glm_strings(void) {
+    const char *end = "</arg_value>";
+    const char *schema = "{\"type\":\"object\",\"properties\":{"
+        "\"n\":{\"type\":\"integer\"},\"bad\":{\"type\":\"integer\"},"
+        "\"id\":{\"type\":\"string\"}}}";
+    agent_tool_call call = {0};
+    agent_tool_call_add_arg(&call, "n", "2", 1, true, end);
+    agent_tool_call_add_arg(&call, "bad", "2x", 2, true, end);
+    agent_tool_call_add_arg(&call, "id", "7", 1, true, end);
+    char *json = agent_mcp_args_to_json(&call, schema);
+    agent_json *v = agent_json_parse(json);
+    AGENT_TEST_ASSERT(v != NULL);
+    agent_json *n = agent_json_get(v, "n");
+    AGENT_TEST_ASSERT(n && n->kind == AGENT_JSON_NUM && n->num == 2);
+    AGENT_TEST_ASSERT(!strcmp(agent_json_str(v, "bad", ""), "2x"));
+    AGENT_TEST_ASSERT(!strcmp(agent_json_str(v, "id", ""), "7"));
+    agent_json_free(v);
+    free(json);
+    agent_tool_call_free(&call);
+}
+
 static void ds4_agent_mcp_unit_tests_run(void) {
     test_agent_json_round_trip();
     test_agent_json_escape_round_trips_through_writer();
     test_agent_json_write_re_emits_schema();
     test_agent_mcp_args_to_json_mixes_string_and_raw();
+    test_agent_mcp_args_to_json_follows_schema_for_glm_strings();
     test_agent_mcp_config_load_parses_servers();
     test_agent_mcp_config_load_missing_file_is_not_an_error();
     test_agent_mcp_config_load_rejects_double_underscore_names();
