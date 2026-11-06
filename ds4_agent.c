@@ -9704,14 +9704,16 @@ static void agent_mcp_server_close(agent_mcp_server *s) {
     if (s->in_fd >= 0) close(s->in_fd);
     if (s->out_fd >= 0) close(s->out_fd);
     s->in_fd = s->out_fd = -1;
-    if (s->alive && s->pid > 0) {
-        kill(s->pid, SIGTERM);
+    /* Signal the whole group: launchers like npx leave the server in a child. */
+    if (s->pid > 0) {
+        kill(-s->pid, SIGTERM);
         int status;
         double start = now_sec();
         while (waitpid(s->pid, &status, WNOHANG) == 0 && now_sec() - start < 1.0)
             usleep(20000);
-        if (waitpid(s->pid, &status, WNOHANG) == 0) kill(s->pid, SIGKILL);
+        kill(-s->pid, SIGKILL);
         waitpid(s->pid, &status, 0);
+        s->pid = 0;
     }
     s->alive = false;
 }
@@ -9814,6 +9816,7 @@ static bool agent_mcp_request(agent_mcp_server *s, const char *method,
     free(req);
     if (!sent) {
         snprintf(err, err_len, "failed to write to server: %s", strerror(errno));
+        agent_mcp_server_close(s);
         return false;
     }
 
@@ -9824,6 +9827,7 @@ static bool agent_mcp_request(agent_mcp_server *s, const char *method,
         char *line = agent_mcp_read_line(s, deadline);
         if (!line) {
             snprintf(err, err_len, "no response from server (timeout or closed pipe)");
+            agent_mcp_server_close(s);
             return false;
         }
         agent_json *resp = agent_json_parse(line);
@@ -9913,6 +9917,7 @@ static bool agent_mcp_server_spawn(agent_mcp_server *s, char *err, size_t err_le
         execvp(s->command, argv);
         _exit(127);
     }
+    setpgid(pid, pid); /* also in the parent, so close() never races the child */
     free(argv);
     close(in_pipe[0]);
     close(out_pipe[1]);
