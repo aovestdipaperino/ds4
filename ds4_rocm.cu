@@ -1,6 +1,7 @@
 #ifdef __HIP_PLATFORM_AMD__
 #include "ds4_rocm.h"
 #include <hipblaslt/hipblaslt.h>
+#include <rocblas/rocblas.h>
 
 #define FULL_WARP_MASK 0xFFFFFFFFFFFFFFFFULL
 #define MASK_T uint64_t
@@ -34,11 +35,32 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <algorithm>
 #include <unordered_map>
 #include <vector>
 
 #include "ds4_gpu.h"
+#include "ds4_image.h"
 
+static thread_local bool g_dspark_verify_mode;
+
+extern "C" void ds4_gpu_set_dspark_verify_mode(bool enabled) {
+    g_dspark_verify_mode = enabled;
+}
+
+extern "C" int ds4_mmq_init(int device);
+extern "C" int ds4_mmq_iq2_xxs_moe_pair(
+    const void *W_a, const void *W_b, const float *X_f32,
+    const int32_t *ids, float *out_a, float *out_b,
+    int M, int K, int n_tokens, int n_experts, int n_expert_used,
+    cudaStream_t stream);
+extern "C" int ds4_mmq_q8_0_dense_vec(
+    const void *W, const float *X_f32, float *out_f32,
+    int M, int N, int K, cudaStream_t stream);
+extern "C" int ds4_mmq_q2_K_moe_down_sum6_vec(
+    const void *W, const float *X, const int32_t *ids, float *out,
+    int M, int K, int n_tokens, int n_experts, int n_expert_used,
+    cudaStream_t stream);
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -52,8 +74,7 @@ enum {
      * decode calls to the online attention kernel so this fixed buffer never
      * becomes an out-of-bounds write at long context. */
     DS4_ROCM_ATTENTION_SCORE_CAP = 8192u,
-    DS4_ROCM_ATTENTION_RAW_SCORE_CAP = 256u,
-    DS4_ROCM_TOPK_MERGE_GROUP = 8u
+    DS4_ROCM_ATTENTION_RAW_SCORE_CAP = 256u
 };
 
 struct ds4_gpu_tensor {
@@ -87,11 +108,29 @@ typedef struct {
     uint16_t qs[CUDA_QK_K / 8];
 } cuda_block_iq2_xxs;
 
+typedef struct {
+    uint8_t e;
+    uint8_t qs[16];
+} cuda_block_mxfp4;
+
+static_assert(sizeof(cuda_block_mxfp4) == 17, "cuda_block_mxfp4 must match the GGUF MXFP4 block layout");
+
+/* Twice the MXFP4 values so each 32-value sub-block can use signed-int8
+ * dp4a; the factor of 1/2 is folded into the sub-block scale. */
+__device__ __constant__ static const int8_t cuda_mxfp4_values_x2[16] = {
+     0,  1,  2,  3,  4,  6,  8,  12,
+     0, -1, -2, -3, -4, -6, -8, -12,
+};
+
 #include "ds4_iq2_tables_cuda.inc"
 
 #include "rocm/ds4_rocm_runtime.cuh"
 
 #include "rocm/ds4_rocm_common.cuh"
+
+extern "C" int ds4_gpu_dspark_gfx1151_fast_path(void) {
+    return ds4_rocm_is_gfx1151();
+}
 
 #include "rocm/ds4_rocm_q8.cuh"
 
@@ -126,6 +165,96 @@ typedef struct {
 
 #include "rocm/ds4_rocm_moe_launch.cuh"
 
+#include "rocm/ds4_rocm_glm.cuh"
+
 #include "rocm/ds4_rocm_hc_output_launch.cuh"
 
 #include "rocm/ds4_rocm_current_api_compat.cuh"
+
+#include "ds4_glm53_vision_gpu.cuh"
+#include "ds4_deepseek4_vision_gpu.cuh"
+#include "rocm/ds4_rocm_deepseek4_vision.cuh"
+#include "ds4_deepseek41_cuda.cuh"
+
+/* Tensor-parallel gates are Metal-only; stubs keep shared graph code
+ * linkable (TP option validation rejects non-Metal backends). */
+extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
+    (void)layer; (void)gate;
+    fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor parallelism is Metal-only\n");
+    return 0;
+}
+
+extern "C" void ds4_gpu_tp_set_batch_exchange(ds4_gpu_tp_batch_exchange_fn fn) {
+    (void)fn;
+}
+
+extern "C" void ds4_gpu_tp_suspend_expert_sharding(int suspend) {
+    (void)suspend;
+}
+
+extern "C" void ds4_gpu_tp_keepalive_pause(int paused) {
+    (void)paused;
+}
+
+extern "C" void ds4_gpu_tp_set_attn_head_split(int enabled) {
+    (void)enabled;
+}
+
+extern "C" void ds4_gpu_model_residency_skip(int skip) {
+    (void)skip;
+}
+
+extern "C" void ds4_gpu_tp_set_big_exchange(ds4_gpu_tp_big_exchange_fn fn) {
+    (void)fn;
+}
+
+extern "C" int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
+                                          const ds4_gpu_tensor *out_t,
+                                          ds4_gpu_tensor *in_t,
+                                          uint64_t bytes) {
+    (void)layer; (void)rows; (void)out_t; (void)in_t; (void)bytes;
+    return 0;
+}
+
+extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
+    (void)layer; (void)rows;
+    fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor parallelism is Metal-only\n");
+    return 0;
+}
+
+extern "C" int ds4_gpu_matmul_q8_0_kslice_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t full_in_dim, uint64_t k_off,
+        uint64_t k_cnt, uint64_t out_dim, const ds4_gpu_tensor *x,
+        uint64_t x_elem_off) {
+    (void)out; (void)model_map; (void)model_size; (void)weight_offset;
+    (void)full_in_dim; (void)k_off; (void)k_cnt; (void)out_dim; (void)x;
+    (void)x_elem_off;
+    fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor parallelism is Metal-only\n");
+    return 0;
+}
+
+extern "C" int ds4_gpu_attention_output_q8_tp_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *low, const void *model_map,
+        uint64_t model_size, uint64_t out_a_offset, uint64_t out_b_offset,
+        uint64_t group_dim, uint64_t rank, uint32_t n_groups_total,
+        uint32_t group0, uint32_t group_cnt, uint64_t out_dim,
+        const ds4_gpu_tensor *heads) {
+    (void)out; (void)low; (void)model_map; (void)model_size;
+    (void)out_a_offset; (void)out_b_offset; (void)group_dim; (void)rank;
+    (void)n_groups_total; (void)group0; (void)group_cnt; (void)out_dim;
+    (void)heads;
+    fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor parallelism is Metal-only\n");
+    return 0;
+}
+
+extern "C" int ds4_gpu_hc_expand_add_tensor(
+        ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out,
+        const ds4_gpu_tensor *block_add, const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *post, const ds4_gpu_tensor *comb,
+        uint32_t n_embd, uint32_t n_hc) {
+    (void)out_hc; (void)block_out; (void)block_add; (void)residual_hc;
+    (void)post; (void)comb; (void)n_embd; (void)n_hc;
+    fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor parallelism is Metal-only\n");
+    return 0;
+}

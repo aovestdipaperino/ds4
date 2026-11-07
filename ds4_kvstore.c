@@ -414,6 +414,12 @@ void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
     kv_le_put64(h + 40, payload_bytes);
 }
 
+/* routed-expert quantizations whose checkpoints the store keys on */
+bool ds4_kvstore_quant_bits_supported(int quant_bits) {
+    return quant_bits == 2 || quant_bits == 4 || quant_bits == 5 ||
+           quant_bits == 6 || quant_bits == 8;
+}
+
 bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,
                              uint32_t *text_bytes) {
     uint8_t h[DS4_KVSTORE_FIXED_HEADER];
@@ -436,7 +442,7 @@ bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,
     if (fread(tb, 1, sizeof(tb), fp) != sizeof(tb)) return false;
     *text_bytes = ds4_kvstore_le_get32(tb);
     e->text_bytes = *text_bytes;
-    return e->tokens != 0 && (e->quant_bits == 2 || e->quant_bits == 4);
+    return e->tokens != 0 && ds4_kvstore_quant_bits_supported(e->quant_bits);
 }
 
 bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],
@@ -940,7 +946,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     ds4_kvstore_tokens_copy_prefix(&store_tokens, tokens, store_len);
 
     const int quant_bits = ds4_engine_routed_quant_bits(engine);
-    if (quant_bits != 2 && quant_bits != 4) {
+    if (!ds4_kvstore_quant_bits_supported(quant_bits)) {
         ds4_tokens_free(&store_tokens);
         return false;
     }
@@ -1224,7 +1230,7 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
     if (effective_prompt) effective_prompt->len = 0;
     if (!kc->enabled || !prompt_text) return 0;
     const int quant_bits = ds4_engine_routed_quant_bits(engine);
-    if (quant_bits != 2 && quant_bits != 4) return 0;
+    if (!ds4_kvstore_quant_bits_supported(quant_bits)) return 0;
     const int model_id = ds4_engine_model_id(engine);
     const size_t prompt_bytes = strlen(prompt_text);
     int idx = ds4_kvstore_find_text_prefix(kc, prompt_text, model_id, quant_bits,
@@ -1318,32 +1324,19 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
         const double load_ms = (kv_now_sec() - load_t0) * 1000.0;
         kc->continued_last_store_tokens = loaded;
         const char *key_kind = ds4_kvstore_key_kind(hdr.ext_flags);
-        bool consumed = false;
-        if (kc->opt.cold_max_tokens > 0 && loaded > kc->opt.cold_max_tokens) {
-            unlink(path);
-            consumed = true;
-            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-                    "%s: kv cache hit text%s%s tokens=%d text=%u quant=%u key=%s load=%.1f ms consumed file=%s",
-                    kv_log_name(kc),
-                    responses_protocol ? " " : "",
-                    responses_protocol ? "RESPPROTO" : "",
-                    loaded, text_bytes, hdr.quant_bits, key_kind, load_ms, path);
-        } else {
-            ds4_kvstore_touch_file(path, hdr.hits + 1);
-            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-                    "%s: kv cache hit text%s%s tokens=%d text=%u quant=%u key=%s load=%.1f ms file=%s",
-                    kv_log_name(kc),
-                    responses_protocol ? " " : "",
-                    responses_protocol ? "RESPPROTO" : "",
-                    loaded, text_bytes, hdr.quant_bits, key_kind, load_ms, path);
-        }
+        ds4_kvstore_touch_file(path, hdr.hits + 1);
+        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                "%s: kv cache hit text%s%s tokens=%d text=%u quant=%u key=%s load=%.1f ms file=%s",
+                kv_log_name(kc),
+                responses_protocol ? " " : "",
+                responses_protocol ? "RESPPROTO" : "",
+                loaded, text_bytes, hdr.quant_bits, key_kind, load_ms, path);
         if (result) {
             result->tokens = loaded;
             result->text_bytes = text_bytes;
             result->quant_bits = hdr.quant_bits;
             result->ext_flags = hdr.ext_flags;
             result->load_ms = load_ms;
-            result->consumed = consumed;
             result->path = kv_xstrdup(path);
         }
     }

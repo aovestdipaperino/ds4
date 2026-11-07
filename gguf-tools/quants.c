@@ -1,10 +1,10 @@
 /*
  * DS4 quantization facade.
  *
- * These are the small GGUF quantization pieces needed by our DeepSeek V4
- * Flash recipes: float conversion, q8_0, q2_K, q4_K, and iq2_xxs.  The code is
- * local C and deliberately narrow; other GGUF type IDs are named for metadata
- * compatibility, but cannot be emitted by this tool.
+ * These are the small quantization pieces needed by our DeepSeek V4, GLM-5.3,
+ * and Qwen3.8 Flash recipes: float conversion, q4_1, q8_0, q2_K, q4_K, and
+ * iq2_xxs.  The code is local C and deliberately narrow; other GGUF type IDs
+ * are named for metadata compatibility, but cannot be emitted by this tool.
  *
  * The quantized block layouts and search procedures are derived from the
  * MIT-licensed GGML/llama.cpp quantizers.  Keep changes conservative: byte
@@ -40,7 +40,7 @@ static const ds4q_traits ds4q_type_traits[DS4Q_TYPE_COUNT] = {
     [DS4Q_TYPE_F32]     = { "f32",      1,   4, false, false },
     [DS4Q_TYPE_F16]     = { "f16",      1,   2, false, false },
     [DS4Q_TYPE_Q4_0]    = { "q4_0",    32,  18, false, false },
-    [DS4Q_TYPE_Q4_1]    = { "q4_1",    32,  20, false, false },
+    [DS4Q_TYPE_Q4_1]    = { "q4_1",    32,  20, true,  false },
     [DS4Q_TYPE_Q5_0]    = { "q5_0",    32,  22, false, false },
     [DS4Q_TYPE_Q5_1]    = { "q5_1",    32,  24, false, false },
     [DS4Q_TYPE_Q8_0]    = { "q8_0",    32,  34, true,  false },
@@ -50,7 +50,7 @@ static const ds4q_traits ds4q_type_traits[DS4Q_TYPE_COUNT] = {
     [DS4Q_TYPE_Q4_K]    = { "q4_K",  QK_K, 144, true,  false },
     [DS4Q_TYPE_Q5_K]    = { "q5_K",  QK_K, 176, false, false },
     [DS4Q_TYPE_Q6_K]    = { "q6_K",  QK_K, 210, false, false },
-    [DS4Q_TYPE_Q8_K]    = { "q8_K",  QK_K, 292, false, false },
+    [DS4Q_TYPE_Q8_K]    = { "q8_K",  QK_K, 292, true,  false },
     [DS4Q_TYPE_IQ2_XXS] = { "iq2_xxs", QK_K,  66, true,  true  },
     [DS4Q_TYPE_IQ2_XS]  = { "iq2_xs",  QK_K,  74, false, true  },
     [DS4Q_TYPE_IQ3_XXS] = { "iq3_xxs", QK_K,  98, false, false },
@@ -123,7 +123,12 @@ static float ds4q_make_qkx2_quants(int n, int nmax, const float *x, const float 
     float max = x[0];
     float sum_w = weights[0];
     float sum_x = sum_w * x[0];
-    for (int i = 1; i < n; i++) {
+    /*
+     * Match llama.cpp's HAVE_BUGGY_APPLE_LINKER reference semantics on every
+     * host.  The volatile induction variable prevents Apple Clang from
+     * reassociating this accumulation and also keeps DS4 pack bytes portable.
+     */
+    for (volatile int i = 1; i < n; i++) {
         if (x[i] < min) min = x[i];
         if (x[i] > max) max = x[i];
         float w = weights[i];
@@ -151,6 +156,7 @@ static float ds4q_make_qkx2_quants(int n, int nmax, const float *x, const float 
         return scale;
     }
     for (int is = 0; is <= nstep; is++) {
+        if (max <= min) break;
         iscale = (rmin + rdelta * is + nmax) / (max - min);
         float sum_l = 0, sum_l2 = 0, sum_xl = 0;
         for (int i = 0; i < n; i++) {
@@ -224,6 +230,7 @@ static float ds4q_make_qkx3_quants(int n, int nmax, const float *x, const float 
         return scale;
     }
     for (int is = 0; is <= nstep; is++) {
+        if (max <= min) break;
         iscale = (rmin + rdelta * is + nmax) / (max - min);
         float sum_l = 0, sum_l2 = 0, sum_xl = 0;
         for (int i = 0; i < n; i++) {
@@ -338,6 +345,44 @@ static void ds4q_get_scale_min_k4(int j, const uint8_t *q, uint8_t *d, uint8_t *
     }
 }
 
+static size_t ds4q_quantize_q4_1(const float *src, void *dst, int64_t start,
+                                 int64_t nrows, int64_t ncols) {
+    const int64_t qk = 32;
+    const size_t row_size = ds4q_row_size(DS4Q_TYPE_Q4_1, ncols);
+    const int64_t start_row = start / ncols;
+    uint8_t *out = (uint8_t *)dst + (size_t)start_row * row_size;
+    const int64_t nblocks = nrows * (ncols / qk);
+
+    for (int64_t b = 0; b < nblocks; b++) {
+        const float *x = src + start + (size_t)b * qk;
+        float min = FLT_MAX;
+        float max = -FLT_MAX;
+        for (int j = 0; j < qk; j++) {
+            const float v = x[j];
+            if (v < min) min = v;
+            if (v > max) max = v;
+        }
+
+        const float d = (max - min) / 15.0f;
+        const float id = d ? 1.0f / d : 0.0f;
+        const uint16_t hd = ds4q_f32_to_f16(d);
+        const uint16_t hm = ds4q_f32_to_f16(min);
+        memcpy(out, &hd, sizeof(hd));
+        memcpy(out + sizeof(hd), &hm, sizeof(hm));
+
+        uint8_t *qs = out + sizeof(hd) + sizeof(hm);
+        for (int j = 0; j < qk / 2; j++) {
+            const float x0 = (x[j] - min) * id;
+            const float x1 = (x[j + qk / 2] - min) * id;
+            const uint8_t q0 = DS4Q_MIN(15, (int8_t)(x0 + 0.5f));
+            const uint8_t q1 = DS4Q_MIN(15, (int8_t)(x1 + 0.5f));
+            qs[j] = q0 | (q1 << 4);
+        }
+        out += ds4q_type_traits[DS4Q_TYPE_Q4_1].type_size;
+    }
+    return (size_t)nrows * row_size;
+}
+
 static size_t ds4q_quantize_q8_0(const float *src, void *dst, int64_t start,
                                  int64_t nrows, int64_t ncols) {
     const int64_t qk = 32;
@@ -362,6 +407,63 @@ static size_t ds4q_quantize_q8_0(const float *src, void *dst, int64_t start,
         int8_t *qs = (int8_t *)(out + sizeof(hd));
         for (int j = 0; j < qk; j++) qs[j] = (int8_t)roundf(x[j] * id);
         out += sizeof(hd) + qk;
+    }
+    return (size_t)nrows * row_size;
+}
+
+static void ds4q_write_q8_k_block(const float *x, uint8_t *y) {
+    enum { d_off = 0, qs_off = 4, bsums_off = 260 };
+    int8_t qs[QK_K];
+    int16_t bsums[QK_K / 16];
+
+    float max = 0.0f;
+    float amax = 0.0f;
+    for (int j = 0; j < QK_K; j++) {
+        const float ax = fabsf(x[j]);
+        if (ax > amax) {
+            amax = ax;
+            max = x[j];
+        }
+    }
+
+    if (amax == 0.0f) {
+        memset(y, 0, ds4q_type_traits[DS4Q_TYPE_Q8_K].type_size);
+        return;
+    }
+
+    const float iscale = -127.0f / max;
+    for (int j = 0; j < QK_K; j++) {
+        int v = (int)lrintf(iscale * x[j]);
+        if (v > 127) v = 127;
+        if (v < -128) v = -128;
+        qs[j] = (int8_t)v;
+    }
+    for (int j = 0; j < QK_K / 16; j++) {
+        int sum = 0;
+        for (int i = 0; i < 16; i++) sum += qs[j * 16 + i];
+        bsums[j] = (int16_t)sum;
+    }
+
+    const float d = 1.0f / iscale;
+    memcpy(y + d_off, &d, sizeof(d));
+    memcpy(y + qs_off, qs, sizeof(qs));
+    memcpy(y + bsums_off, bsums, sizeof(bsums));
+}
+
+static size_t ds4q_quantize_q8_k(const float *src, void *dst, int64_t start,
+                                 int64_t nrows, int64_t ncols) {
+    const size_t row_size = ds4q_row_size(DS4Q_TYPE_Q8_K, ncols);
+    const int64_t start_row = start / ncols;
+    uint8_t *out = (uint8_t *)dst + (size_t)start_row * row_size;
+    const int64_t blocks_per_row = ncols / QK_K;
+
+    for (int64_t row = 0; row < nrows; row++) {
+        const float *xrow = src + start + (size_t)row * (size_t)ncols;
+        for (int64_t b = 0; b < blocks_per_row; b++) {
+            uint8_t *block = out + (size_t)row * row_size +
+                             (size_t)b * ds4q_type_traits[DS4Q_TYPE_Q8_K].type_size;
+            ds4q_write_q8_k_block(xrow + (size_t)b * QK_K, block);
+        }
     }
     return (size_t)nrows * row_size;
 }
@@ -1050,9 +1152,17 @@ void ds4q_quantize_init(ds4q_type type) {
 size_t ds4q_quantize_chunk(ds4q_type type, const float *src, void *dst,
                            int64_t start, int64_t nrows, int64_t ncols,
                            const float *imatrix) {
+    if (type == DS4Q_TYPE_Q4_1) {
+        (void)imatrix;
+        return ds4q_quantize_q4_1(src, dst, start, nrows, ncols);
+    }
     if (type == DS4Q_TYPE_Q8_0) {
         (void)imatrix;
         return ds4q_quantize_q8_0(src, dst, start, nrows, ncols);
+    }
+    if (type == DS4Q_TYPE_Q8_K) {
+        (void)imatrix;
+        return ds4q_quantize_q8_k(src, dst, start, nrows, ncols);
     }
     if (type == DS4Q_TYPE_Q2_K) {
         return ds4q_quantize_q2_k(src, dst, start, nrows, ncols, imatrix);
