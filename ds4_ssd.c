@@ -77,18 +77,52 @@ uint32_t ds4_ssd_cache_experts_for_byte_budget(uint64_t bytes,
     return (uint32_t)experts;
 }
 
+static uint64_t ds4_ssd_auto_cache_percent(uint32_t default_percent) {
+    const char *env = getenv("DS4_SSD_AUTO_CACHE_PCT");
+    if (env && env[0]) {
+        errno = 0;
+        char *end = NULL;
+        unsigned long v = strtoul(env, &end, 10);
+        if (end != env && *end == '\0' && errno == 0 &&
+            v >= 50 && v <= 95) {
+            return (uint64_t)v;
+        }
+        fprintf(stderr,
+                "ds4: invalid DS4_SSD_AUTO_CACHE_PCT=%s (want 50..95); "
+                "using default\n",
+                env);
+    }
+    /*
+     * Decode on the ROCm streaming path is SSD-bandwidth bound: every routed
+     * expert miss is a random NVMe read, so a larger resident expert cache is
+     * the biggest decode-throughput lever.  BUT the expert cache lives in the
+     * same physical RAM as the OS on a unified-memory APU, and transient
+     * spikes (pinned read/upload staging, the prefill headroom, cache growth)
+     * ride on top of the steady-state plan.  Pushing the split too high runs
+     * the machine out of RAM and trips the Linux OOM killer.  80% was measured
+     * safe here; opt into more only deliberately via DS4_SSD_AUTO_CACHE_PCT.
+     */
+    return default_percent;
+}
+
 bool ds4_ssd_auto_cache_plan(uint64_t            recommended_bytes,
+                             uint32_t            default_percent,
+                             uint64_t            model_limit_bytes,
                              uint64_t            non_routed_bytes,
                              uint64_t            per_expert_bytes,
                              uint64_t            max_model_experts,
                              ds4_ssd_cache_plan *out) {
     if (!out) return false;
     memset(out, 0, sizeof(*out));
-    if (recommended_bytes == 0 || per_expert_bytes == 0) return false;
+    if (recommended_bytes == 0 || per_expert_bytes == 0 ||
+        default_percent < 50 || default_percent > 95) return false;
 
+    const uint64_t pct = ds4_ssd_auto_cache_percent(default_percent);
     out->model_target_bytes =
-        recommended_bytes > UINT64_MAX / 4ull ?
-            UINT64_MAX : (recommended_bytes * 4ull) / 5ull;
+        recommended_bytes > UINT64_MAX / pct ?
+            UINT64_MAX : (recommended_bytes * pct) / 100ull;
+    if (model_limit_bytes != 0 && out->model_target_bytes > model_limit_bytes)
+        out->model_target_bytes = model_limit_bytes;
     if (out->model_target_bytes > non_routed_bytes) {
         out->cache_bytes = out->model_target_bytes - non_routed_bytes;
     }

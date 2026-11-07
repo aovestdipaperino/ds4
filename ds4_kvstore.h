@@ -103,7 +103,6 @@ typedef struct {
     uint8_t quant_bits;
     uint8_t ext_flags;
     double load_ms;
-    bool consumed;
     char *path;
 } ds4_kvstore_load_result;
 
@@ -214,5 +213,7 @@ char *ds4_kvstore_path_join(const char *dir, const char *name);
 char *ds4_kvstore_path_for_sha(ds4_kvstore *kc, const char sha[41]);
 void ds4_kvstore_le_put32(uint8_t *p, uint32_t v);
 uint32_t ds4_kvstore_le_get32(const uint8_t *p);
+
+bool ds4_kvstore_quant_bits_supported(int quant_bits);
 
 #endif
